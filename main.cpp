@@ -1,19 +1,34 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
 class Node {
-protected:
+public:
   std::string name;
 };
 
 class Program : public Node {
+public:
   std::vector<std::unique_ptr<Node>> program;
 };
 
 class ExpressionNode : public Node {};
+
+enum class BinaryOperator : uint32_t { ADD };
+
+class BinaryExpressionNode : ExpressionNode {
+public:
+  BinaryExpressionNode(uint32_t lhs, BinaryOperator ops, uint32_t rhs)
+      : lhs(lhs), op(ops), rhs(rhs) {}
+
+private:
+  uint32_t lhs;
+  BinaryOperator op;
+  uint32_t rhs;
+};
 
 class FunctionNode : public Node {
 public:
@@ -29,15 +44,37 @@ uint32_t parsePosition = 0U;
 
 void parseExpression() {}
 
-void parseFunction() {}
+std::unique_ptr<Node> parseFunction(std::vector<std::string> &tokens) {
+  std::unique_ptr<FunctionNode> function = std::make_unique<FunctionNode>();
+  parsePosition++;
+  std::string_view functionName = tokens.at(parsePosition);
+  function->name = functionName;
+  parsePosition++; // current is (
+  parsePosition++; // current is )
+  parsePosition++; // current is {
+  parsePosition++;
+  std::string_view lhs = tokens.at(parsePosition);
+  std::cout << "lhs = " << lhs << std::endl;
+  parsePosition++;
+  std::string_view operation = tokens.at(parsePosition);
+  std::cout << "operator is " << operation << std::endl;
+  parsePosition++;
+  std::string_view rhs = tokens.at(parsePosition);
+  std::cout << "rhs = " << rhs << std::endl;
+  std::unique_ptr<BinaryExpressionNode> binary =
+      std::make_unique<BinaryExpressionNode>(stoi(lhs), operation, stoi(rhs));
+  return function;
+}
 
 void parseProgram() {}
 
 void parse(std::vector<std::string> &tokens) {
+  std::unique_ptr<Program> program = std::make_unique<Program>();
   parsePosition = 0U;
   std::string_view token = tokens.at(parsePosition);
   if (token == "func") {
     std::cout << "function parse" << std::endl;
+    parseFunction(tokens);
   }
 }
 
