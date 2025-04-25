@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -8,21 +9,28 @@
 class Node {
 public:
   std::string name;
+  virtual void codeGen() = 0;
+  virtual ~Node() = default;
 };
 
 class Program : public Node {
 public:
   std::vector<std::unique_ptr<Node>> program;
+  virtual void codeGen() {}
 };
 
-class ExpressionNode : public Node {};
+class ExpressionNode : public Node {
+public:
+  virtual void codeGen() {}
+};
 
 enum class BinaryOperator : uint32_t { ADD };
 
-class BinaryExpressionNode : ExpressionNode {
+class BinaryExpressionNode : public ExpressionNode {
 public:
   BinaryExpressionNode(uint32_t lhs, BinaryOperator ops, uint32_t rhs)
       : lhs(lhs), op(ops), rhs(rhs) {}
+  virtual void codeGen() {}
 
 private:
   uint32_t lhs;
@@ -35,6 +43,7 @@ public:
   std::vector<std::unique_ptr<ExpressionNode>> &getExpressions() {
     return expressions;
   }
+  virtual void codeGen() {}
 
 private:
   std::vector<std::unique_ptr<ExpressionNode>> expressions;
@@ -53,16 +62,23 @@ std::unique_ptr<Node> parseFunction(std::vector<std::string> &tokens) {
   parsePosition++; // current is )
   parsePosition++; // current is {
   parsePosition++;
-  std::string_view lhs = tokens.at(parsePosition);
+  std::string lhs = tokens.at(parsePosition);
   std::cout << "lhs = " << lhs << std::endl;
   parsePosition++;
   std::string_view operation = tokens.at(parsePosition);
   std::cout << "operator is " << operation << std::endl;
   parsePosition++;
-  std::string_view rhs = tokens.at(parsePosition);
+  std::string rhs = tokens.at(parsePosition);
   std::cout << "rhs = " << rhs << std::endl;
+  BinaryOperator op;
+  if (operation == "+") {
+    op = BinaryOperator::ADD;
+  }
   std::unique_ptr<BinaryExpressionNode> binary =
-      std::make_unique<BinaryExpressionNode>(stoi(lhs), operation, stoi(rhs));
+      std::make_unique<BinaryExpressionNode>(
+          static_cast<uint32_t>(std::stoul(lhs)), op,
+          static_cast<uint32_t>(std::stoul(rhs)));
+  function->getExpressions().push_back(std::move(binary));
   return function;
 }
 
