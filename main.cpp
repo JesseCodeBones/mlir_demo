@@ -11,6 +11,7 @@
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/ExecutionEngine/CRunnerUtils.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
+#include "mlir/ExecutionEngine/JitRunner.h"
 #include "mlir/ExecutionEngine/MemRefUtils.h"
 #include "mlir/ExecutionEngine/RunnerUtils.h"
 #include "mlir/IR/Builders.h"
@@ -64,6 +65,7 @@ public:
       : lhs(lhs), op(ops), rhs(rhs) {}
   virtual void codeGen() override {
     // TODO fix this as general purpose generator
+    llvm::DebugFlag = true;
     mlir::DialectRegistry registry;
     mlir::registerAllDialects(registry);
     mlir::registerBuiltinDialectTranslation(registry);
@@ -75,7 +77,7 @@ public:
     auto module = mlir::ModuleOp::create(builder.getUnknownLoc());
     auto funcType = builder.getFunctionType({}, {});
     auto function = builder.create<mlir::func::FuncOp>(builder.getUnknownLoc(),
-                                                       "main", funcType);
+                                                       "jessetest", funcType);
     auto entryBlock = function.addEntryBlock();
     builder.setInsertionPointToStart(entryBlock);
 
@@ -100,9 +102,23 @@ public:
       std::cerr << "run failed!!\n";
     }
     module.print(llvm::outs());
+    llvm::InitializeNativeTarget();
     auto jitOrError = mlir::ExecutionEngine::create(module);
-    std::unique_ptr<mlir::ExecutionEngine> jit = std::move(jitOrError.get());
-    llvm::Error error = jit->invoke("main");
+    if (!jitOrError) {
+      // 处理错误
+      llvm::errs() << "Error: " << llvm::toString(jitOrError.takeError())
+                   << "\n";
+    }
+    std::unique_ptr<mlir::ExecutionEngine> jit = std::move(*jitOrError);
+    auto targetFunc = jit->lookup("jessetest");
+    if (!targetFunc) {
+      llvm::errs() << "target function not found \n";
+    }
+    // llvm::Error error = jit->invoke("jessetest");
+    // if (!error) {
+    //   // 处理错误
+    //   llvm::errs() << "Error: " << error << "\n";
+    // }
   }
 
 private:
