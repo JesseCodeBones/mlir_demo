@@ -1,3 +1,4 @@
+#include <optional>
 #define GET_OP_CLASSES
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
@@ -13,6 +14,7 @@
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/JitRunner.h"
 #include "mlir/ExecutionEngine/MemRefUtils.h"
+#include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/ExecutionEngine/RunnerUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -24,16 +26,128 @@
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
+#include "llvm/ExecutionEngine/ExecutionEngine.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdint>
 #include <iostream>
 #include <memory>
 #include <mlir/IR/BuiltinOps.h>
+#include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
 #include <string>
 #include <string_view>
 #include <vector>
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+class TestJIT {
+
+private:
+    static llvm::Expected<llvm::orc::ThreadSafeModule>
+  optimizeModule(llvm::orc::ThreadSafeModule TSM, const llvm::orc::MaterializationResponsibility &R) {
+        TSM.withModuleDo([](llvm::Module &M) {
+          // Create a function pass manager.
+          auto FPM = std::make_unique<llvm::legacy::FunctionPassManager>(&M);
+
+          // Add some optimizations.
+          FPM->add(llvm::createInstructionCombiningPass());
+          FPM->add(llvm::createReassociatePass());
+          FPM->add(llvm::createGVNPass());
+          FPM->add(llvm::createCFGSimplificationPass());
+          FPM->doInitialization();
+
+          // Run the optimizations over all functions in the module being added to
+          // the JIT.
+          for (auto &F : M)
+              FPM->run(F);
+          });
+
+        return std::move(TSM);
+    }
+
+private:
+    std::unique_ptr<llvm::orc::ExecutionSession> ES;
+    llvm::orc::RTDyldObjectLinkingLayer ObjectLayer;
+    llvm::orc::IRCompileLayer CompileLayer;
+
+    llvm::orc::IRTransformLayer TransformLayer;
+
+    llvm::DataLayout DL;
+    llvm::orc::MangleAndInterner Mangle;
+
+    llvm::orc::JITDylib &Dylib;
+
+public:
+    TestJIT() = delete;
+
+    TestJIT(std::unique_ptr<llvm::orc::ExecutionSession> ES,
+            llvm::orc::JITTargetMachineBuilder JTMB, llvm::DataLayout DL)
+        : ES(std::move(ES)), DL(std::move(DL)), Mangle(*this->ES, this->DL),
+          ObjectLayer(*this->ES,
+                      []() { return std::make_unique<llvm::SectionMemoryManager>(); }),
+          CompileLayer(*this->ES, ObjectLayer,
+                       std::make_unique<llvm::orc::ConcurrentIRCompiler>(std::move(JTMB))),
+          TransformLayer(*this->ES, this->CompileLayer, optimizeModule),
+          Dylib(this->ES->createBareJITDylib("<main>")) {
+        Dylib.addGenerator(
+            llvm::cantFail(llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+                DL.getGlobalPrefix())));
+        if (JTMB.getTargetTriple().isOSBinFormatCOFF()) {
+            ObjectLayer.setOverrideObjectFlagsWithResponsibilityFlags(true);
+            ObjectLayer.setAutoClaimResponsibilityForObjectSymbols(true);
+        }
+    }
+
+    ~TestJIT() {
+        if (auto err = ES->endSession()) {
+            ES->reportError(std::move(err));
+        }
+    }
+
+    static llvm::Expected<std::unique_ptr<TestJIT> > create() {
+        auto EPC = llvm::orc::SelfExecutorProcessControl::Create();
+        if (!EPC)
+            return EPC.takeError();
+
+        auto ES = std::make_unique<llvm::orc::ExecutionSession>(std::move(*EPC));
+
+        llvm::orc::JITTargetMachineBuilder JTMB(
+            ES->getExecutorProcessControl().getTargetTriple());
+
+        auto DL = JTMB.getDefaultDataLayoutForTarget();
+        if (!DL)
+            return DL.takeError();
+
+        return std::make_unique<TestJIT>(std::move(ES), std::move(JTMB),
+                                         std::move(*DL));
+    }
+
+    auto &getDataLayout() {
+        return this->DL;
+    }
+
+    auto& getDylib() const {
+        return this->Dylib;
+    }
+
+    llvm::Error addModule(llvm::orc::ThreadSafeModule &&TSM, llvm::orc::ResourceTrackerSP RT = nullptr) {
+        if (!RT) { RT = Dylib.getDefaultResourceTracker(); }
+        auto module = TSM.getModuleUnlocked();
+        module->setDataLayout(DL);
+        return CompileLayer.add(RT, std::move(TSM));
+    }
+
+    llvm::Expected<llvm::orc::ExecutorSymbolDef> lookup(const llvm::StringRef Name) {
+        llvm::outs() << "Lookup " << Name << "\n";
+        Dylib.dump(llvm::outs());
+        return ES->lookup({&Dylib}, Mangle(Name));
+    }
+};
+
 
 class Node {
 public:
@@ -57,7 +171,54 @@ public:
   virtual void codeGen() override {}
 };
 
-enum class BinaryOperator : uint32_t { ADD };
+enum class BinaryOperator : uint32_t { ADD, SUB, MUL, DIV };
+std::unique_ptr<llvm::Module> dumpLLVMIR(mlir::ModuleOp module, llvm::LLVMContext &llvmContext) {
+  // Register the translation to LLVM IR with the MLIR context.
+  mlir::registerBuiltinDialectTranslation(*module->getContext());
+  mlir::registerLLVMDialectTranslation(*module->getContext());
+
+  // Convert the module to LLVM IR in a new LLVM IR context.
+  auto llvmModule = mlir::translateModuleToLLVMIR(module, llvmContext);
+  if (!llvmModule) {
+    llvm::errs() << "Failed to emit LLVM IR\n";
+    return nullptr;
+  }
+
+  // Initialize LLVM targets.
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+
+  // Configure the LLVM Module
+  auto tmBuilderOrError = llvm::orc::JITTargetMachineBuilder::detectHost();
+  if (!tmBuilderOrError) {
+    llvm::errs() << "Could not create JITTargetMachineBuilder\n";
+    return nullptr;
+  }
+
+  auto tmOrError = tmBuilderOrError->createTargetMachine();
+  if (!tmOrError) {
+    llvm::errs() << "Could not create TargetMachine\n";
+    return nullptr;
+  }
+  mlir::ExecutionEngine::setupTargetTripleAndDataLayout(llvmModule.get(),
+                                                        tmOrError.get().get());
+
+  /// Optionally run an optimization pipeline over the llvm module.
+  auto optPipeline = mlir::makeOptimizingTransformer(
+      /*optLevel=*/0, /*sizeLevel=*/0,
+      /*targetMachine=*/nullptr);
+  if (auto err = optPipeline(llvmModule.get())) {
+    llvm::errs() << "Failed to optimize LLVM IR " << err << "\n";
+    return nullptr;
+  }
+  llvm::outs() << *llvmModule << "\n";
+  return llvmModule;
+}
+
+
+int runJit(mlir::ModuleOp &module) {
+
+}
 
 class BinaryExpressionNode : public ExpressionNode {
 public:
@@ -65,7 +226,8 @@ public:
       : lhs(lhs), op(ops), rhs(rhs) {}
   virtual void codeGen() override {
     // TODO fix this as general purpose generator
-    llvm::DebugFlag = true;
+    // llvm::DebugFlag = true;
+    llvm::ExitOnError exitOnError;
     mlir::DialectRegistry registry;
     mlir::registerAllDialects(registry);
     mlir::registerBuiltinDialectTranslation(registry);
@@ -75,21 +237,51 @@ public:
     context.getOrLoadDialect<mlir::arith::ArithDialect>();
     context.getOrLoadDialect<mlir::func::FuncDialect>();
     auto module = mlir::ModuleOp::create(builder.getUnknownLoc());
-    auto funcType = builder.getFunctionType({}, {});
-    auto function = builder.create<mlir::func::FuncOp>(builder.getUnknownLoc(),
-                                                       "jessetest", funcType);
-    auto entryBlock = function.addEntryBlock();
-    builder.setInsertionPointToStart(entryBlock);
+    auto i32t = mlir::IntegerType::get(&context, 32);
+    auto funcType = builder.getFunctionType(std::nullopt, i32t);
+    {
+      auto function = builder.create<mlir::func::FuncOp>(
+          builder.getUnknownLoc(), "testFun", funcType);
+      auto entryBlock = function.addEntryBlock();
+      builder.setInsertionPointToStart(entryBlock);
 
-    auto intType = mlir::IntegerType::get(&context, 32);
-    auto lhsConst = builder.create<mlir::arith::ConstantIntOp>(
-        builder.getUnknownLoc(), lhs, intType);
-    auto rhsConst = builder.create<mlir::arith::ConstantIntOp>(
-        builder.getUnknownLoc(), rhs, intType);
-    builder.create<mlir::arith::AddIOp>(builder.getUnknownLoc(), lhsConst,
-                                        rhsConst);
-    builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc());
-    module.push_back(function);
+      auto intType = mlir::IntegerType::get(&context, 32);
+      auto lhsConst = builder.create<mlir::arith::ConstantIntOp>(
+          builder.getUnknownLoc(), lhs, intType);
+      auto rhsConst = builder.create<mlir::arith::ConstantIntOp>(
+          builder.getUnknownLoc(), rhs, intType);
+      switch (op) {
+        case BinaryOperator::ADD: {
+          auto addOp =  builder.create<mlir::arith::AddIOp>(builder.getUnknownLoc(), lhsConst,
+                                          rhsConst);
+          builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc(), addOp.getResult());
+          break;
+        }
+        case BinaryOperator::SUB: {
+          auto addOp =  builder.create<mlir::arith::SubIOp>(builder.getUnknownLoc(), lhsConst,
+                                          rhsConst);
+          builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc(), addOp.getResult());
+          break;
+        }
+        case BinaryOperator::MUL: {
+          auto addOp =  builder.create<mlir::arith::MulIOp>(builder.getUnknownLoc(), lhsConst,
+                                          rhsConst);
+          builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc(), addOp.getResult());
+          break;
+        }
+        case BinaryOperator::DIV: {
+          auto addOp =  builder.create<mlir::arith::DivSIOp>(builder.getUnknownLoc(), lhsConst,
+                                          rhsConst);
+          builder.create<mlir::func::ReturnOp>(builder.getUnknownLoc(), addOp.getResult());
+          break;
+        }
+        default:
+        exit(1);
+      }
+
+      module.push_back(function);
+    }
+
     // generate IR
 
     mlir::PassManager pm(module->getName());
@@ -102,23 +294,25 @@ public:
       std::cerr << "run failed!!\n";
     }
     module.print(llvm::outs());
-    llvm::InitializeNativeTarget();
-    auto jitOrError = mlir::ExecutionEngine::create(module);
-    if (!jitOrError) {
-      // 处理错误
-      llvm::errs() << "Error: " << llvm::toString(jitOrError.takeError())
-                   << "\n";
+    auto llvm_context = std::make_unique<llvm::LLVMContext>();
+    auto llvm_module = dumpLLVMIR(module, *llvm_context);
+    auto jit = TestJIT::create();
+    if (!jit) {
+      llvm::errs() << "Failed to create LLVM jit\n";
     }
-    std::unique_ptr<mlir::ExecutionEngine> jit = std::move(*jitOrError);
-    auto targetFunc = jit->lookup("jessetest");
-    if (!targetFunc) {
-      llvm::errs() << "target function not found \n";
+
+    auto err = (*jit)->addModule({std::move(llvm_module), std::move(llvm_context)},
+      (*jit)->getDylib().createResourceTracker());
+   if (err) {
+     llvm::errs() << "Failed to create LLVM jit\n";
+   }
+    auto symbol = (*jit)->lookup("testFun");
+    if (!symbol) {
+      llvm::errs() << "Failed to lookup LLVM jit\n";
     }
-    // llvm::Error error = jit->invoke("jessetest");
-    // if (!error) {
-    //   // 处理错误
-    //   llvm::errs() << "Error: " << error << "\n";
-    // }
+    auto fun = (int(*)()) symbol->getAddress().getValue();
+    llvm::outs() << "jit code address is: 0x" << &fun << "\n";
+    std::cout << "jit code call result = " << std::dec << fun() << "\n";
   }
 
 private:
@@ -161,8 +355,25 @@ std::unique_ptr<Node> parseFunction(std::vector<std::string> &tokens) {
   parsePosition++;
   std::string rhs = tokens.at(parsePosition);
   BinaryOperator op;
-  if (operation == "+") {
-    op = BinaryOperator::ADD;
+  switch (operation[0]) {
+    case '+': {
+      op = BinaryOperator::ADD;
+      break;
+    }
+    case '-': {
+      op = BinaryOperator::SUB;
+      break;
+    }
+    case '*': {
+      op = BinaryOperator::MUL;
+      break;
+    }
+    case '/': {
+      op = BinaryOperator::DIV;
+      break;
+    }
+    default:
+      exit(1);
   }
   std::unique_ptr<BinaryExpressionNode> binary =
       std::make_unique<BinaryExpressionNode>(
@@ -189,7 +400,7 @@ void tokenizer(std::vector<std::string> &tokens, std::string &program) {
   std::string token;
   for (auto c : program) {
     if (c == ' ' || c == ';' || c == '{' || c == '}' || c == '(' || c == ')' ||
-        c == '+') {
+        c == '+' || c == '-' || c == '*' || c == '/') {
       if (!token.empty()) {
         tokens.push_back(token);
         token.clear();
@@ -205,11 +416,13 @@ void tokenizer(std::vector<std::string> &tokens, std::string &program) {
     tokens.push_back(token);
   }
 }
-
+using namespace llvm;
 int main(int, char **) {
-  std::string input{"func myAdd(){ 3+4 }"};
+  std::string input{"func myAdd(){ 12*21 }"};
   std::vector<std::string> tokens;
   tokenizer(tokens, input);
   auto program = parse(tokens);
   program->codeGen();
+
+  return 0;
 }
